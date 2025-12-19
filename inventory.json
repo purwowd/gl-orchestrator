@@ -1,0 +1,13 @@
+{
+  "routers": [
+    {
+      "ip": "192.168.8.1",
+      "username": "root",
+      "password": "admin.admin",
+      "wifi": {
+        "ch_24": 1,
+        "ch_5": 36
+      }
+    }
+  ]
+}
