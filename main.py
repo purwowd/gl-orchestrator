@@ -119,6 +119,29 @@ def read_channels_from_get_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def read_channels_from_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Read channel from status.wifi runtime information."""
+    out = {}
+    wifi_list = status.get("wifi", [])
+    if not isinstance(wifi_list, list):
+        return out
+    
+    for wifi in wifi_list:
+        if not isinstance(wifi, dict):
+            continue
+        band = wifi.get("band", "")
+        channel = wifi.get("channel")
+        name = wifi.get("name", "")
+        
+        # Get channel from default (non-guest) interface
+        if band == "2G" and "radio0" in name and "2.4" not in out:
+            out["2.4"] = {"channel": channel}
+        elif band == "5G" and "radio1" in name and "5" not in out:
+            out["5"] = {"channel": channel}
+    
+    return out
+
+
 def build_payload(band: Dict[str, Any], iface: Dict[str, Any], new_channel: int) -> Dict[str, Any]:
     # preserve iface + band fields like UI
     return {
@@ -203,10 +226,14 @@ def try_persist_methods(url: str, sid: str, device: str, channel: int) -> List[s
     
     # Save/commit methods that might persist config
     save_methods = [
-        ("uci", "commit"),
-        ("wifi", "save"),
-        ("wifi", "apply"),
-        ("network.wireless", "commit"),
+        ("file", "exec", {"command": "uci commit wireless"}),
+        ("file", "exec", {"command": "wifi reload"}),
+        ("uci", "commit", {"package": "wireless"}),
+        ("uci", "commit", {}),
+        ("wifi", "save", {}),
+        ("wifi", "apply", {}),
+        ("wifi", "commit", {}),
+        ("network.wireless", "commit", {}),
     ]
     
     # Methods that need channel/device args
@@ -250,12 +277,18 @@ def try_persist_methods(url: str, sid: str, device: str, channel: int) -> List[s
                 continue
     
     # Try save/commit methods first (they persist config)
-    for obj, m in save_methods:
+    for item in save_methods:
+        if len(item) == 2:
+            obj, m = item
+            args = {}
+        else:
+            obj, m, args = item
+        
         if (obj, m) in tried:
             continue
         try:
-            call(url, sid, obj, m, {}, rid=212)
-            successes.append(f"{obj}.{m} {{}}")
+            call(url, sid, obj, m, args, rid=212)
+            successes.append(f"{obj}.{m} {args}")
         except Exception:
             continue
     
@@ -339,11 +372,38 @@ def set_channels_on_router(item: Dict[str, Any]) -> Dict[str, Any]:
     # Try persist/apply methods after all configs are set
     persist_success = []
     if ch_5 is not None:
-        # First try reload to persist 5G changes
+        # For 5G, try multiple approaches to persist
+        # 1. Try save/commit methods first
+        try_save_methods = [
+            ("uci", "commit", {"package": "wireless"}),
+            ("uci", "commit", {}),
+            ("wifi", "save", {}),
+        ]
+        for obj, method, args in try_save_methods:
+            try:
+                call(url, sid, obj, method, args, rid=140)
+                persist_success.append(f"{obj}.{method}")
+                break
+            except Exception:
+                continue
+        
+        # 2. Then try reload
         reload_wifi_after_config(url, sid, "radio1")
-        time.sleep(0.5)
-        # Then try other persist methods
-        persist_success = try_persist_methods(url, sid, "radio1", int(ch_5))
+        time.sleep(1.0)  # Wait longer after reload
+        
+        # 3. Re-apply set_config for default interface to force persist
+        if b5 and b5.get("ifaces"):
+            default_iface = next((iface for iface in b5.get("ifaces", []) if isinstance(iface, dict) and iface.get("name") == "default_radio1"), None)
+            if default_iface:
+                try:
+                    p = build_payload(b5, default_iface, int(ch_5))
+                    wifi_set_config(url, sid, p)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+        
+        # 4. Try other persist methods
+        persist_success.extend(try_persist_methods(url, sid, "radio1", int(ch_5)))
     elif ch_24 is not None:
         # Try reload for 2.4G as well
         reload_wifi_after_config(url, sid, "radio0")
@@ -361,20 +421,53 @@ def set_channels_on_router(item: Dict[str, Any]) -> Dict[str, Any]:
     after_raw = wifi_get_config(url, sid)
     after = read_channels_from_get_config(after_raw)
 
-    ok = True
-    if ch_24 is not None and str(after.get("2.4", {}).get("channel")) != str(int(ch_24)):
-        ok = False
-    if ch_5 is not None and str(after.get("5", {}).get("channel")) != str(int(ch_5)):
-        ok = False
-
     status = call(url, sid, "system", "get_status", {}, rid=50)
+    # Also check status for runtime channel (fallback if get_config doesn't reflect changes)
+    after_status = read_channels_from_status(status)
+
+    ok = True
+    config_persisted = True  # Track if config file actually changed
+    runtime_changed = True   # Track if runtime actually changed
+    
+    # Check 2.4GHz - use status as fallback if get_config doesn't match
+    if ch_24 is not None:
+        config_ch = after.get("2.4", {}).get("channel")
+        status_ch = after_status.get("2.4", {}).get("channel")
+        expected = int(ch_24)
+        if str(config_ch) != str(expected):
+            config_persisted = False
+        if str(status_ch) != str(expected):
+            runtime_changed = False
+        if not (str(config_ch) == str(expected) or str(status_ch) == str(expected)):
+            ok = False
+    
+    # Check 5GHz - use status as fallback if get_config doesn't match
+    if ch_5 is not None:
+        config_ch = after.get("5", {}).get("channel")
+        status_ch = after_status.get("5", {}).get("channel")
+        expected = int(ch_5)
+        if str(config_ch) != str(expected):
+            config_persisted = False
+        if str(status_ch) != str(expected):
+            runtime_changed = False
+        if not (str(config_ch) == str(expected) or str(status_ch) == str(expected)):
+            ok = False
+
+    # Add note if runtime changed but config didn't persist
+    note = None
+    if runtime_changed and not config_persisted and (ch_5 is not None or ch_24 is not None):
+        note = "Channel changed in runtime but not persisted to config file (will revert after reboot)"
 
     return {
         "ip": ip,
         "ok": ok,
+        "config_persisted": config_persisted,
+        "runtime_changed": runtime_changed,
         "before_get_config": before,
         "after_get_config": after,
+        "after_status": after_status,
         "persist_attempts_success": persist_success,
+        "note": note,
         "status": status,
     }
 
