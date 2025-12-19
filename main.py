@@ -193,10 +193,20 @@ def try_persist_methods(url: str, sid: str, device: str, channel: int) -> List[s
     # Reload methods don't need channel args - they just reload current config
     reload_methods = [
         ("wifi", "reload"),
+        ("wifi", "restart"),
         ("network.wireless", "reload"),
         ("network", "reload"),
         ("network.wireless", "up"),
         ("network.wireless", "down"),
+        ("wireless", "reload"),
+    ]
+    
+    # Save/commit methods that might persist config
+    save_methods = [
+        ("uci", "commit"),
+        ("wifi", "save"),
+        ("wifi", "apply"),
+        ("network.wireless", "commit"),
     ]
     
     # Methods that need channel/device args
@@ -238,6 +248,16 @@ def try_persist_methods(url: str, sid: str, device: str, channel: int) -> List[s
                 break
             except Exception:
                 continue
+    
+    # Try save/commit methods first (they persist config)
+    for obj, m in save_methods:
+        if (obj, m) in tried:
+            continue
+        try:
+            call(url, sid, obj, m, {}, rid=212)
+            successes.append(f"{obj}.{m} {{}}")
+        except Exception:
+            continue
     
     # Try reload methods separately (no channel args needed)
     for obj, m in reload_methods:
@@ -284,11 +304,7 @@ def set_band_channel(url: str, sid: str, band: Dict[str, Any], channel: int) -> 
                 continue
             wifi_set_config(url, sid, p)
     
-    # For 5GHz (radio1), reload wifi to persist the change
-    device = band.get("device")
-    if device == "radio1":
-        reload_wifi_after_config(url, sid, device)
-        time.sleep(0.5)  # Give it a moment to reload
+    # Note: We don't reload here anymore - let it be handled after all configs are set
 
 
 def set_channels_on_router(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -320,17 +336,25 @@ def set_channels_on_router(item: Dict[str, Any]) -> Dict[str, Any]:
             raise RuntimeError(f"{ip}: radio1 not found")
         set_band_channel(url, sid, b5, int(ch_5))
 
-    # Try persist/apply methods specifically for radio1 if needed
+    # Try persist/apply methods after all configs are set
     persist_success = []
     if ch_5 is not None:
+        # First try reload to persist 5G changes
+        reload_wifi_after_config(url, sid, "radio1")
+        time.sleep(0.5)
+        # Then try other persist methods
         persist_success = try_persist_methods(url, sid, "radio1", int(ch_5))
+    elif ch_24 is not None:
+        # Try reload for 2.4G as well
+        reload_wifi_after_config(url, sid, "radio0")
+        time.sleep(0.5)
 
-    # Wait longer for 5G changes to take effect, especially if persist methods didn't work
+    # Wait longer for changes to take effect, especially if persist methods didn't work
     # If persist methods succeeded (non-empty list), we can wait less
     if ch_5 is not None:
-        wait_time = 3.0 if not persist_success else 2.0
+        wait_time = 4.0 if not persist_success else 2.5
     elif ch_24 is not None:
-        wait_time = 1.5
+        wait_time = 2.0
     else:
         wait_time = 1.0
     time.sleep(wait_time)
@@ -371,7 +395,7 @@ def print_progress_bar(completed: int, total: int, prefix: str = "Progress", len
     filled = int(length * percent)
     bar = "█" * filled + "░" * (length - filled)
     percent_str = f"{percent * 100:.1f}%"
-    print(f"\r{prefix}: [{bar}] {percent_str} ({completed}/{total})", end="", file=sys.stderr, flush=True)
+    print(f"{prefix}: [{bar}] {percent_str} ({completed}/{total})", file=sys.stderr, flush=True)
 
 
 def main():
@@ -387,6 +411,8 @@ def main():
     completed = 0
 
     print(f"Processing {total} router(s) with {args.workers} worker(s)...", file=sys.stderr)
+    # Show initial progress bar (0%)
+    print_progress_bar(0, total)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(set_channels_on_router, r): r for r in routers}
@@ -400,13 +426,9 @@ def main():
                 result = fut.result()
                 results.append(result)
                 status = "✓" if result.get("ok", False) else "✗"
-                # Clear progress bar line and show result
-                print("\r" + " " * 80, end="", file=sys.stderr, flush=True)
-                print(f"\r[{completed}/{total}] {status} {ip}", file=sys.stderr, flush=True)
+                print(f"[{completed}/{total}] {status} {ip}", file=sys.stderr, flush=True)
             except Exception as e:
                 results.append({"ip": ip, "ok": False, "error_type": type(e).__name__, "error": str(e)})
-                # Clear progress bar line and show error
-                print("\r" + " " * 80, end="", file=sys.stderr, flush=True)
                 # Extract meaningful error message (after IP if present, otherwise use type)
                 error_str = str(e)
                 if ":" in error_str and ip in error_str:
@@ -414,11 +436,10 @@ def main():
                     error_msg = error_str.split(":", 1)[1].strip()
                 else:
                     error_msg = type(e).__name__
-                print(f"\r[{completed}/{total}] ✗ {ip} - ERROR: {error_msg}", file=sys.stderr, flush=True)
+                print(f"[{completed}/{total}] ✗ {ip} - ERROR: {error_msg}", file=sys.stderr, flush=True)
             
-            # Show progress bar for remaining
-            if completed < total:
-                print_progress_bar(completed, total)
+            # Update progress bar
+            print_progress_bar(completed, total)
 
     print("", file=sys.stderr)
     print("Done!", file=sys.stderr)
